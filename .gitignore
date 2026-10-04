@@ -122,3 +122,7 @@ InitTestScene*.unity*
 .obsidian/plugins/mermaid-zoom/styles.css
 .obsidian/themes/Minimal/manifest.json
 .obsidian/themes/Minimal/theme.css
+.obsidian/plugins/remote-ssh/data.json
+.obsidian/plugins/remote-ssh/main.js
+.obsidian/plugins/remote-ssh/manifest.json
+.obsidian/plugins/remote-ssh/styles.css
