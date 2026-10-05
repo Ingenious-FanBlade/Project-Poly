@@ -1,0 +1,90 @@
+# 里程碑验收（Docs/TDD/构建与测试.md 第 5 节）：只在 main 的干净提交上、由自托管 Windows x64 运行器执行，
+# 任何 PR 都不在该运行器上运行。各阶段调用与本地相同的批处理入口 Tools/CI/Invoke-BattleSlice.ps1。
+#
+# 运行器前置条件：已登录用户的交互式桌面会话（不能以 Windows 服务运行），标签 battle-slice；
+# 预装 Unity 6000.6.1f1、Windows Build Support (IL2CPP)、有效许可、MSVC 工具链与 Windows SDK、Git LFS、PowerShell 7；
+# 编辑器不在默认 Hub 路径时设置环境变量 UNITY_EDITOR_PATH。
+# 运行器就绪前，仓库变量 ACCEPTANCE_RUNNER_READY 保持未设置，作业不会排队。
+name: 里程碑验收
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'Docs/**'
+      - '.obsidian/**'
+      - '*.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  acceptance:
+    name: 战斗垂直切片验收
+    # 手动触发也只接受 main；其他分支的代码不进入自托管运行器。
+    if: github.ref == 'refs/heads/main' && vars.ACCEPTANCE_RUNNER_READY == 'true'
+    runs-on: [self-hosted, Windows, X64, battle-slice]
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: 检出触发提交
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          lfs: true
+          clean: false
+          persist-credentials: false
+
+      - name: 清理工作区（保留 Library 缓存）
+        run: |
+          git reset --hard $env:GITHUB_SHA
+          git clean -ffdx -e Library/
+
+      - name: 准备运行目录
+        id: run
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "battle-slice/$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          "root=$root" >> $env:GITHUB_OUTPUT
+
+      - name: 固定输入快照
+        run: ./Tools/CI/Invoke-BattleSlice.ps1 -Stage Snapshot -Mode Acceptance -OutputRoot '${{ steps.run.outputs.root }}' -ExpectedRevision $env:GITHUB_SHA
+
+      - name: 输入预检
+        run: ./Tools/CI/Invoke-BattleSlice.ps1 -Stage Precheck -OutputRoot '${{ steps.run.outputs.root }}'
+
+      - name: 导入与编译
+        run: ./Tools/CI/Invoke-BattleSlice.ps1 -Stage ImportCompile -OutputRoot '${{ steps.run.outputs.root }}'
+
+      - name: EditMode 测试
+        run: ./Tools/CI/Invoke-BattleSlice.ps1 -Stage EditMode -OutputRoot '${{ steps.run.outputs.root }}'
+
+      - name: PlayMode 测试
+        run: ./Tools/CI/Invoke-BattleSlice.ps1 -Stage PlayMode -OutputRoot '${{ steps.run.outputs.root }}'
+
+      - name: 构建 Windows x64 玩家程序
+        run: ./Tools/CI/Invoke-BattleSlice.ps1 -Stage Build -OutputRoot '${{ steps.run.outputs.root }}'
+
+      - name: 玩家程序冒烟
+        run: ./Tools/CI/Invoke-BattleSlice.ps1 -Stage Smoke -OutputRoot '${{ steps.run.outputs.root }}'
+
+      - name: 汇总验收
+        # 前序阶段失败时仍须汇总，把缺失阶段标为未运行。
+        if: ${{ !cancelled() && steps.run.outcome == 'success' }}
+        run: ./Tools/CI/Invoke-BattleSlice.ps1 -Stage Summarize -OutputRoot '${{ steps.run.outputs.root }}'
+
+      - name: 上传记录、日志与构建产物
+        if: ${{ !cancelled() && steps.run.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: battle-slice-acceptance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.run.outputs.root }}
+          if-no-files-found: warn
+          retention-days: 30

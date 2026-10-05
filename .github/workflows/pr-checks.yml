@@ -1,0 +1,202 @@
+# PR 检查：合并前的开发验证，不形成 AcceptanceRecord（Docs/TDD/构建与测试.md 第 5 节）。
+# - 仓库检查：所有 PR（含 fork）都运行，不使用密钥。
+# - Unity 检查：本仓库分支发起的 PR 在此运行；fork PR 由 pr-unity-fork.yml 在维护者批准后运行。
+#   两者都向 PR head 提交写入同名提交状态「Unity 检查」，供分支保护设为必需检查。
+# - main 推送时同样运行，以刷新 main 作用域的 Library 缓存，供后续 PR 恢复。
+name: PR 检查
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'Docs/**'
+      - '.obsidian/**'
+      - '*.md'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  UNITY_VERSION: 6000.6.1f1
+  UNITY_IMAGE: unityci/editor:ubuntu-6000.6.1f1-windows-mono-3
+  REQUIRED_CASES: Tools/CI/RequiredChecks/battle-slice-v1.json
+
+jobs:
+  scope:
+    name: 识别改动范围
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+    outputs:
+      unity: ${{ steps.scope.outputs.unity }}
+    steps:
+      - name: 判断是否涉及 Unity 输入
+        id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
+        run: |
+          # 只改 Docs/、.obsidian/ 或根目录 Markdown 的 PR 不需要 Unity 检查；其余一律按涉及 Unity 输入处理。
+          if [ "$CHANGED_FILES" -ge 3000 ]; then
+            echo "改动文件数达到 API 列表上限，按涉及 Unity 输入处理。"
+            echo "unity=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" \
+            --jq '.[] | .filename, (.previous_filename // empty)' > changed-files.txt
+          if grep -qvE '^(Docs/|\.obsidian/|[^/]+\.md$)' changed-files.txt; then
+            echo "unity=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "unity=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  repository:
+    name: 仓库检查
+    needs: scope
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 检查生成文件、.meta、GUID、LFS 指针与 Build Profile
+        shell: pwsh
+        env:
+          # 识别失败时按涉及 Unity 输入处理。
+          CHECK_BUILD_PROFILES: ${{ needs.scope.outputs.unity != 'false' }}
+        run: |
+          $params = @{
+            OutputPath         = "$env:RUNNER_TEMP/ci/repository-inputs.json"
+            CheckBuildProfiles = $env:CHECK_BUILD_PROFILES -eq 'true'
+            SnapshotId         = "${{ github.event_name == 'push' && 'main' || 'pr' }}-$env:GITHUB_SHA"
+          }
+          ./Tools/CI/Test-RepositoryInputs.ps1 @params
+
+      - name: 上传检查记录
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: repository-inputs
+          path: ${{ runner.temp }}/ci/
+          retention-days: 14
+
+  unity:
+    name: Unity 检查（本仓库分支）
+    needs: scope
+    if: >-
+      ${{ !cancelled()
+        && needs.scope.outputs.unity != 'false'
+        && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    # Unity 许可凭据（UNITY_LICENSE、UNITY_EMAIL、UNITY_PASSWORD，Pro 另加 UNITY_SERIAL）只存放在环境中。
+    environment: unity-pr
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: 生成 LFS 对象清单
+        run: git lfs ls-files --long | cut -d ' ' -f1 | sort > .lfs-assets-id
+
+      - name: 恢复 LFS 缓存
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .git/lfs
+          key: lfs-${{ hashFiles('.lfs-assets-id') }}
+
+      - name: 拉取 LFS 资源
+        run: git lfs pull
+
+      - name: 恢复 Library 缓存
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: Library
+          key: Library-${{ env.UNITY_VERSION }}-windows-mono-${{ hashFiles('Assets/**', 'Packages/**', 'ProjectSettings/**') }}
+          restore-keys: |
+            Library-${{ env.UNITY_VERSION }}-windows-mono-
+
+      - name: 运行 EditMode 与 PlayMode 测试（排除依赖显卡的用例）
+        uses: game-ci/unity-test-runner@fa6ced25861c16ef56187828c43f76d00df43a23 # v4.3.2
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+          UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+        with:
+          unityVersion: ${{ env.UNITY_VERSION }}
+          customImage: ${{ env.UNITY_IMAGE }}
+          testMode: all
+          artifactsPath: unity-test-results
+          customParameters: -buildTarget StandaloneWindows64 -testCategory !RequiresGraphics
+
+      - name: 按必需用例清单核对结果
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $params = @{
+            ResultsPath              = 'unity-test-results'
+            RequiredCasesPath        = $env:REQUIRED_CASES
+            TestPlatform             = 'EditMode', 'PlayMode'
+            ExcludeGraphicsDependent = $true
+            OutputPath               = "$env:RUNNER_TEMP/ci/unity-tests.json"
+            SnapshotId               = "${{ github.event_name == 'push' && 'main' || 'pr' }}-$env:GITHUB_SHA"
+            Label                    = 'Unity 检查'
+          }
+          ./Tools/CI/Test-UnityTestResults.ps1 @params
+
+      - name: 上传测试结果
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unity-tests
+          path: |
+            unity-test-results/
+            ${{ runner.temp }}/ci/
+          if-no-files-found: warn
+          retention-days: 14
+
+  unity-status:
+    name: 回报 Unity 检查状态
+    needs: [scope, unity]
+    if: >-
+      ${{ !cancelled()
+        && github.event_name == 'pull_request'
+        && github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      statuses: write
+    steps:
+      - name: 写入 PR head 提交状态
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          SCOPE_RESULT: ${{ needs.scope.result }}
+          UNITY_SCOPE: ${{ needs.scope.outputs.unity }}
+          UNITY_RESULT: ${{ needs.unity.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "$SCOPE_RESULT" != "success" ]; then
+            state=failure; description="无法识别改动范围"
+          elif [ "$UNITY_SCOPE" = "false" ]; then
+            state=success; description="仅文档改动，未运行 Unity 检查"
+          elif [ "$UNITY_RESULT" = "success" ]; then
+            state=success; description="导入编译与测试通过"
+          else
+            state=failure; description="Unity 检查未通过（$UNITY_RESULT）"
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+            -f state="$state" -f context="Unity 检查" -f description="$description" -f target_url="$RUN_URL"

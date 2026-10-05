@@ -1,0 +1,173 @@
+# fork PR 的 Unity 检查（Docs/TDD/构建与测试.md 第 5 节）。
+# fork 发起的 pull_request 拿不到仓库密钥，因此由 pull_request_target 触发；该事件运行的是 main 上的工作流定义，
+# 并具有密钥与 main 缓存作用域，所以：
+# - 检出并执行 PR 代码的作业绑定受保护环境 unity-pr-fork，须维护者审阅代码后批准；PR 每次推送都需重新批准。
+# - 只检出触发时固定的 PR head 提交，令牌只读、不持久化凭据，缓存只恢复不保存。
+# - 结果核对脚本与必需用例清单取自 main，PR 不能借修改它们放宽检查。
+# - 作业结束后由单独的作业向 PR head 提交写入状态「Unity 检查」。
+name: PR Unity 检查（fork）
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  UNITY_VERSION: 6000.6.1f1
+  UNITY_IMAGE: unityci/editor:ubuntu-6000.6.1f1-windows-mono-3
+
+jobs:
+  gate:
+    name: 登记 fork PR 的 Unity 检查
+    if: github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+      statuses: write
+    outputs:
+      unity: ${{ steps.scope.outputs.unity }}
+    steps:
+      - name: 判断是否涉及 Unity 输入
+        id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
+        run: |
+          # 与 pr-checks.yml 相同：只改 Docs/、.obsidian/ 或根目录 Markdown 时不需要 Unity 检查。
+          if [ "$CHANGED_FILES" -ge 3000 ]; then
+            echo "改动文件数达到 API 列表上限，按涉及 Unity 输入处理。"
+            echo "unity=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" \
+            --jq '.[] | .filename, (.previous_filename // empty)' > changed-files.txt
+          if grep -qvE '^(Docs/|\.obsidian/|[^/]+\.md$)' changed-files.txt; then
+            echo "unity=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "unity=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 写入待批准或不适用状态
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          UNITY_SCOPE: ${{ steps.scope.outputs.unity }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "$UNITY_SCOPE" = "false" ]; then
+            state=success; description="仅文档改动，未运行 Unity 检查"
+          else
+            state=pending; description="等待维护者审阅代码并批准 unity-pr-fork 环境"
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+            -f state="$state" -f context="Unity 检查" -f description="$description" -f target_url="$RUN_URL"
+
+  unity:
+    name: Unity 检查（fork，需批准）
+    needs: gate
+    if: needs.gate.outputs.unity == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    # 环境须配置 Required reviewers；Unity 许可凭据只存放在该环境中。
+    environment: unity-pr-fork
+    permissions:
+      contents: read
+    steps:
+      - name: 检出 main 上的检查脚本
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: ci-base
+          sparse-checkout: Tools/CI
+          persist-credentials: false
+
+      - name: 检出已批准的 PR head 提交
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: project
+          lfs: true
+          persist-credentials: false
+          # 本作业只在维护者审阅代码并批准 unity-pr-fork 环境后运行，见文件头说明。
+          allow-unsafe-pr-checkout: true
+
+      - name: 恢复 Library 缓存（只读）
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: project/Library
+          key: Library-${{ env.UNITY_VERSION }}-windows-mono-${{ hashFiles('project/Assets/**', 'project/Packages/**', 'project/ProjectSettings/**') }}
+          restore-keys: |
+            Library-${{ env.UNITY_VERSION }}-windows-mono-
+
+      - name: 运行 EditMode 与 PlayMode 测试（排除依赖显卡的用例）
+        uses: game-ci/unity-test-runner@fa6ced25861c16ef56187828c43f76d00df43a23 # v4.3.2
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+          UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+        with:
+          projectPath: project
+          unityVersion: ${{ env.UNITY_VERSION }}
+          customImage: ${{ env.UNITY_IMAGE }}
+          testMode: all
+          artifactsPath: unity-test-results
+          customParameters: -buildTarget StandaloneWindows64 -testCategory !RequiresGraphics
+
+      - name: 按 main 上的必需用例清单核对结果
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        working-directory: project
+        run: |
+          $params = @{
+            ResultsPath              = '../unity-test-results'
+            RequiredCasesPath        = '../ci-base/Tools/CI/RequiredChecks/battle-slice-v1.json'
+            TestPlatform             = 'EditMode', 'PlayMode'
+            ExcludeGraphicsDependent = $true
+            OutputPath               = "$env:RUNNER_TEMP/ci/unity-tests.json"
+            SnapshotId               = 'pr-${{ github.event.pull_request.head.sha }}'
+            Label                    = 'Unity 检查（fork）'
+          }
+          ../ci-base/Tools/CI/Test-UnityTestResults.ps1 @params
+
+      - name: 上传测试结果
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unity-tests-fork
+          path: |
+            unity-test-results/
+            ${{ runner.temp }}/ci/
+          if-no-files-found: warn
+          retention-days: 14
+
+  report:
+    name: 回报 fork PR 的 Unity 检查状态
+    needs: [gate, unity]
+    if: ${{ !cancelled() && needs.gate.result == 'success' && needs.gate.outputs.unity == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      statuses: write
+    steps:
+      - name: 写入 PR head 提交状态
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          UNITY_RESULT: ${{ needs.unity.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "$UNITY_RESULT" = "success" ]; then
+            state=success; description="导入编译与测试通过"
+          else
+            state=failure; description="Unity 检查未通过或未获批准（$UNITY_RESULT）"
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+            -f state="$state" -f context="Unity 检查" -f description="$description" -f target_url="$RUN_URL"

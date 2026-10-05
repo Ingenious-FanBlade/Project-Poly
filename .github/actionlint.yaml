@@ -1,0 +1,4 @@
+# actionlint 配置：声明自托管验收运行器的自定义标签（见 workflows/acceptance.yml）。
+self-hosted-runner:
+  labels:
+    - battle-slice
