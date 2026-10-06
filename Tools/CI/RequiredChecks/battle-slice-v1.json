@@ -1,0 +1,5 @@
+{
+  "checkSetVersion": "battle-slice-v1",
+  "description": "战斗垂直切片的必需编辑器测试用例（BS-01 至 BS-09），格式见 Tools/CI/Test-UnityTestResults.ps1。用例尚未实施，清单为空时 Unity 检查与验收均不能通过。",
+  "cases": []
+}
